@@ -89,7 +89,7 @@ def get_projects_by_scope(
     credentials,
     run_mode,
     organization_id=None,
-    folder_id=None,
+    folder_ids=None,
     project_ids=None,
 ):
     """
@@ -110,17 +110,31 @@ def get_projects_by_scope(
             credentials,
         )
 
+    
     elif run_mode == "folder":
 
-        if not folder_id:
+        if not folder_ids:
             raise ValueError(
-                "FOLDER_ID is required."
+                "FOLDER_IDS cannot be empty when RUN_MODE=folder."
             )
 
-        projects = _collect_folder_projects(
-            folder_id,
-            credentials,
-        )
+        projects = []
+
+        for folder_id in folder_ids:
+            projects.extend(
+                _collect_folder_projects(
+                    folder_id,
+                    credentials,
+                )
+            )
+
+        # Remove duplicates in case folders overlap
+        unique = {}
+
+        for project in projects:
+            unique[project["project_id"]] = project
+
+        projects = list(unique.values())
 
     elif run_mode == "projects":
 

@@ -137,9 +137,7 @@ def main():
         "ORGANIZATION_ID"
     )
 
-    folder_id = os.getenv(
-        "FOLDER_ID"
-    )
+    folder_ids = parse_list(os.getenv("FOLDER_IDS"))
 
     project_ids = parse_list(
         os.getenv("PROJECT_IDS")
@@ -149,7 +147,7 @@ def main():
         credentials=credentials,
         run_mode=run_mode,
         organization_id=organization_id,
-        folder_id=folder_id,
+        folder_id=folder_ids,
         project_ids=project_ids,
     )
 
