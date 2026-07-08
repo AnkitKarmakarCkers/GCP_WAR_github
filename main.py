@@ -1,11 +1,11 @@
-import os
 import importlib
 import logging
+import os
 
 from dotenv import load_dotenv
 
 from utils.gcp_auth import get_credentials
-from utils.gcp_projects import get_all_active_projects
+from utils.gcp_scope import get_projects_by_scope
 from utils.logger_setup import setup_logger
 
 
@@ -16,118 +16,152 @@ EXECUTION_ORDER = [
 ]
 
 
-def parse_env_list(value):
-    """Convert comma-separated env variable into a set."""
+def parse_list(value):
+
     if not value:
         return set()
-    return {item.strip() for item in value.split(",") if item.strip()}
+
+    return {
+        item.strip()
+        for item in value.split(",")
+        if item.strip()
+    }
 
 
-def run_all_modules(base_folder, credentials, org_id, projects):
-    """
-    Folder structure:
+def run_modules(
+    credentials,
+    org_id,
+    projects,
+):
 
-    module/
-        compute_engine/
-            inventory.py
-            recommendation.py
-            pricing.py
+    services = parse_list(
+        os.getenv("SERVICES")
+    )
 
-        cloud_tasks/
-            inventory.py
-            recommendation.py
+    components = parse_list(
+        os.getenv("COMPONENTS")
+    )
 
-        cloud_sql/
-            inventory.py
-    """
+    base = "module"
 
-    selected_modules = parse_env_list(os.getenv("MODULES"))
-    selected_components = parse_env_list(os.getenv("COMPONENTS"))
+    for service in sorted(os.listdir(base)):
 
-    if selected_modules:
-        logging.info(f"Selected modules: {sorted(selected_modules)}")
-    else:
-        logging.info("Running all modules")
-
-    if selected_components:
-        logging.info(f"Selected components: {sorted(selected_components)}")
-    else:
-        logging.info("Running all components")
-
-    for service in sorted(os.listdir(base_folder)):
-        service_path = os.path.join(base_folder, service)
+        service_path = os.path.join(
+            base,
+            service,
+        )
 
         if not os.path.isdir(service_path):
             continue
 
-        if selected_modules and service not in selected_modules:
-            logging.info(f"Skipping module: {service}")
+        if services and service not in services:
             continue
 
         logging.info("=" * 80)
-        logging.info(f"Processing module: {service}")
+        logging.info(
+            f"Service : {service}"
+        )
         logging.info("=" * 80)
 
         for component in EXECUTION_ORDER:
 
-            if selected_components and component not in selected_components:
+            if (
+                components
+                and component not in components
+            ):
                 continue
 
-            script_path = os.path.join(service_path, f"{component}.py")
+            file = os.path.join(
+                service_path,
+                f"{component}.py",
+            )
 
-            if not os.path.exists(script_path):
+            if not os.path.exists(file):
                 continue
 
-            module_name = script_path.replace(os.sep, ".").replace(".py", "")
+            module_name = (
+                file.replace(os.sep, ".")
+                .replace(".py", "")
+            )
+
+            logging.info(
+                f"Running {module_name}"
+            )
 
             try:
-                logging.info(f"▶ Running {module_name}")
 
-                module = importlib.import_module(module_name)
+                module = importlib.import_module(
+                    module_name
+                )
 
-                if not hasattr(module, "main"):
-                    logging.warning(f"{module_name} does not define main(). Skipping.")
+                if not hasattr(
+                    module,
+                    "main",
+                ):
+                    logging.warning(
+                        f"{module_name} has no main()."
+                    )
                     continue
 
-                try:
-                    module.main(credentials, org_id, projects)
-                except TypeError:
-                    try:
-                        module.main(credentials, org_id)
-                    except TypeError:
-                        module.main(credentials)
+                module.main(
+                    credentials=credentials,
+                    org_id=org_id,
+                    projects=projects,
+                )
 
-                logging.info(f"✔ Completed {module_name}")
+                logging.info(
+                    f"Completed {module_name}"
+                )
 
             except Exception:
-                logging.exception(f"Failed to execute {module_name}")
+
+                logging.exception(
+                    f"Failed : {module_name}"
+                )
 
 
 def main():
-    setup_logger()
-    load_dotenv()
 
-    logging.info("Starting CloudKeeper GCP WAR")
+    setup_logger()
+
+    load_dotenv()
 
     credentials = get_credentials()
 
-    org_id = os.getenv("ORGANIZATION_ID")
-    run_mode = os.getenv("RUN_MODE", "org").lower()
+    run_mode = os.getenv(
+        "RUN_MODE",
+        "org",
+    )
 
-    if run_mode != "org":
-        logging.error("Currently only 'org' mode is supported.")
-        return
+    organization_id = os.getenv(
+        "ORGANIZATION_ID"
+    )
 
-    projects = get_all_active_projects(credentials, org_id)
+    folder_id = os.getenv(
+        "FOLDER_ID"
+    )
 
-    run_all_modules(
-        base_folder="module",
+    project_ids = parse_list(
+        os.getenv("PROJECT_IDS")
+    )
+
+    projects = get_projects_by_scope(
         credentials=credentials,
-        org_id=org_id,
+        run_mode=run_mode,
+        organization_id=organization_id,
+        folder_id=folder_id,
+        project_ids=project_ids,
+    )
+
+    run_modules(
+        credentials=credentials,
+        org_id=organization_id,
         projects=projects,
     )
 
-    logging.info("WAR execution completed successfully.")
+    logging.info(
+        "WAR execution completed."
+    )
 
 
 if __name__ == "__main__":
