@@ -1,363 +1,317 @@
-# """
-# Cloud Scheduler recommendations.
-
-# Re-fetches every Cloud Scheduler job in every in-scope project (reusing
-# inventory.py's job-fetching logic) and evaluates each job against a
-# fixed set of WAR rules. Every rule a job triggers becomes one row in
-# the "Cloud Scheduler Recommendations" tab of the WAR sheet.
+import datetime as dt
+import logging
+import os
 
-# Configuration (optional environment variables):
-#     SCHEDULER_STALE_DAYS   Days since last successful/attempted run
-#                            before an ENABLED job is flagged "stale".
-#                            Default: 30.
+from croniter import croniter
 
-# Notes on rule interpretation (spec was intentionally literal; a few
-# rules needed a concrete decision to avoid false positives):
+from utils.gsheet_helper import (
+    read_sheet,
+    write_to_sheet,
+)
 
-# - "Failed Last Execution" is scoped to Status == "Failed" specifically,
-#   not "Status != Success" literally, so jobs that have simply never
-#   run yet aren't mislabeled as "failed".
-# - "Missing Service Account" only evaluates HTTP-target jobs. App
-#   Engine targets run as the App Engine default service account and
-#   Pub/Sub targets have no per-job service account concept at all, so
-#   flagging every non-HTTP job would be noise, not a real finding.
-# - "Stale Scheduler Job" only evaluates jobs that have run at least
-#   once (Last Run is set). A job that's ENABLED but has literally
-#   never executed is a different problem than staleness.
-# - "High Frequency Schedule" estimates executions/day by walking the
-#   cron schedule with croniter over a 24h window (exact, not a regex
-#   guess) rather than assuming a specific cron dialect by hand.
-#   Requires the 'croniter' package: pip install croniter
-# """
-
-# import datetime as dt
-# import logging
-# import os
-
-# from croniter import croniter
-# from google.cloud import scheduler_v1
-
-# from module.cloud_scheduler.inventory import (
-#     _fmt_duration,
-#     _fmt_timestamp,
-#     _get_last_execution_status,
-#     _get_target_info,
-#     iter_project_jobs,
-# )
-# from utils.gsheet_helper import write_to_sheet
+SHEET_NAME = "Cloud Scheduler Inventory"
 
+STALE_DAYS = int(os.getenv("SCHEDULER_STALE_DAYS", "30"))
 
-# SHEET_NAME = "Cloud Scheduler Recommendations"
+HIGH_FREQUENCY_THRESHOLD = 96
 
-# HEADERS = [
-#     "Project ID",
-#     "Region",
-#     "Job Name",
-#     "Service",
-#     "Recommendation Title",
-#     "Pillar",
-#     "Recommendation",
-#     "Columns Evaluated",
-#     "Condition",
-#     "Observed Value",
-# ]
 
-# SERVICE_NAME = "Cloud Scheduler"
+def parse_datetime(value):
+    """
+    Converts ISO timestamp from sheet into datetime.
+    """
 
-# HIGH_FREQUENCY_THRESHOLD_PER_DAY = 96
+    if not value:
+        return None
 
-# STALE_DAYS_THRESHOLD = int(os.getenv("SCHEDULER_STALE_DAYS", "30"))
+    try:
+        value = value.replace("Z", "+00:00")
+        return dt.datetime.fromisoformat(value)
+    except Exception:
+        return None
 
 
-# def _estimate_daily_executions(cron_expr, cap=100000):
-#     """
-#     Returns the number of times a cron schedule fires in a 24h window,
-#     computed exactly with croniter rather than guessed from the string
-#     shape. Returns None if the schedule can't be parsed (e.g. it's an
-#     App Engine legacy "every N minutes" string instead of unix-cron).
-#     """
+def estimate_daily_runs(cron_expression):
+    """
+    Estimate executions/day using croniter.
+    """
 
-#     try:
+    if not cron_expression:
+        return 0
 
-#         base = dt.datetime(2026, 1, 1)
-#         start = base - dt.timedelta(seconds=1)
-#         end = base + dt.timedelta(days=1)
+    try:
 
-#         itr = croniter(cron_expr, start)
-#         count = 0
+        base = dt.datetime(2026, 1, 1)
+        end = base + dt.timedelta(days=1)
 
-#         while count < cap:
+        itr = croniter(cron_expression, base)
 
-#             nxt = itr.get_next(dt.datetime)
+        count = 0
 
-#             if nxt >= end:
-#                 break
+        while True:
 
-#             count += 1
+            nxt = itr.get_next(dt.datetime)
 
-#         return count
+            if nxt >= end:
+                break
 
-#     except (ValueError, KeyError):
+            count += 1
 
-#         return None
+        return count
 
+    except Exception:
 
-# def _extract_job_facts(job):
-#     """
-#     Pulls the specific fields the rules below need out of a raw Job
-#     proto, matching the same derivations inventory.py uses so the two
-#     sheets stay consistent with each other.
-#     """
+        return 0
 
-#     target_type = job._pb.WhichOneof("target")
-#     _, service_account = _get_target_info(job)
 
-#     retry_config = job.retry_config
+def add_recommendation(bucket, text):
+    """
+    Avoid duplicate recommendations.
+    """
 
-#     return {
-#         "job_name": job.name.split("/")[-1],
-#         "state": job.state.name,
-#         "status": _get_last_execution_status(job),
-#         "last_run": job.last_attempt_time,
-#         "cron_schedule": job.schedule,
-#         "target_type": target_type,
-#         "service_account": service_account,
-#         "retry_enabled": bool(retry_config.retry_count),
-#         "max_retry_attempts": retry_config.retry_count,
-#         "max_retry_duration": retry_config.max_retry_duration,
-#     }
+    if text not in bucket:
+        bucket.append(text)
 
 
-# # --- Individual rule checks -------------------------------------------
-# # Each returns an "observed value" string when the job trips the rule,
-# # or None when it doesn't.
+def evaluate_row(row):
 
-# def _rule_disabled_job(facts):
+    operational = []
+    reliability = []
+    security = []
+    cost = []
 
-#     if facts["state"] == "DISABLED":
-#         return f"State = {facts['state']}"
+    state = row.get("State", "").strip()
 
-#     return None
+    status = row.get(
+        "Status of last execution",
+        "",
+    ).strip()
 
+    retry_enabled = row.get(
+        "Retry Enabled",
+        "",
+    ).strip()
 
-# def _rule_failed_last_execution(facts):
+    retry_attempts = row.get(
+        "Max retry attempts",
+        "0",
+    ).strip()
 
-#     if facts["status"] == "Failed":
-#         return f"Status of Last Execution = {facts['status']}"
-
-#     return None
-
-
-# def _rule_no_retry_policy(facts):
-
-#     if not facts["retry_enabled"] or facts["max_retry_attempts"] == 0:
-#         return (
-#             f"Retry Enabled = {'Yes' if facts['retry_enabled'] else 'No'}, "
-#             f"Max Retry Attempts = {facts['max_retry_attempts']}"
-#         )
-
-#     return None
-
-
-# def _rule_unlimited_retry_duration(facts):
-
-#     if not facts["max_retry_duration"]:
-#         return "Max Retry Duration = 0s"
-
-#     return None
-
-
-# def _rule_missing_service_account(facts):
-
-#     if facts["target_type"] != "http_target":
-#         return None
-
-#     if not facts["service_account"]:
-#         return "Service Account = (empty)"
-
-#     return None
-
-
-# def _rule_stale_job(facts):
-
-#     if facts["state"] != "ENABLED":
-#         return None
-
-#     if not facts["last_run"]:
-#         return None
-
-#     last_run = facts["last_run"]
-
-#     if last_run.tzinfo is None:
-#         last_run = last_run.replace(tzinfo=dt.timezone.utc)
-
-#     now = dt.datetime.now(dt.timezone.utc)
-#     age_days = (now - last_run).days
-
-#     if age_days > STALE_DAYS_THRESHOLD:
-#         return (
-#             f"State = ENABLED, Last Run = {_fmt_timestamp(facts['last_run'])} "
-#             f"({age_days} days ago)"
-#         )
-
-#     return None
-
-
-# def _rule_high_frequency(facts):
-
-#     daily_count = _estimate_daily_executions(facts["cron_schedule"])
-
-#     if daily_count is None:
-#         return None
-
-#     if daily_count > HIGH_FREQUENCY_THRESHOLD_PER_DAY:
-#         return (
-#             f"Cron Schedule = '{facts['cron_schedule']}' "
-#             f"(~{daily_count} executions/day)"
-#         )
-
-#     return None
-
-
-# RULES = [
-#     {
-#         "title": "Disabled Scheduler Job",
-#         "pillar": "Operational Excellence",
-#         "recommendation": "Remove Disabled Scheduler Jobs",
-#         "columns": "State",
-#         "condition": "State = DISABLED",
-#         "check": _rule_disabled_job,
-#     },
-#     {
-#         "title": "Failed Last Execution",
-#         "pillar": "Reliability",
-#         "recommendation": "Review job as the most recent execution failed",
-#         "columns": "Status of Last Execution",
-#         "condition": "Status != Success",
-#         "check": _rule_failed_last_execution,
-#     },
-#     {
-#         "title": "No Retry Policy Configured",
-#         "pillar": "Reliability",
-#         "recommendation": "Configure retries for critical workloads",
-#         "columns": "Retry Enabled, Max Retry Attempts",
-#         "condition": "Retry Enabled = No OR Max Retry Attempts = 0",
-#         "check": _rule_no_retry_policy,
-#     },
-#     {
-#         "title": "Unlimited Retry Duration",
-#         "pillar": "Reliability",
-#         "recommendation": (
-#             "Review: job configured with unlimited retry duration to "
-#             "avoid excessive retries"
-#         ),
-#         "columns": "Max Retry Duration",
-#         "condition": "Max Retry Duration = 0s",
-#         "check": _rule_unlimited_retry_duration,
-#     },
-#     {
-#         "title": "Missing Service Account",
-#         "pillar": "Security",
-#         "recommendation": (
-#             "Configure a dedicated service account for job authentication."
-#         ),
-#         "columns": "Service Account",
-#         "condition": "Service Account is NULL or Empty",
-#         "check": _rule_missing_service_account,
-#     },
-#     {
-#         "title": "Stale Scheduler Job",
-#         "pillar": "Operational Excellence",
-#         "recommendation": "Remove Stale jobs",
-#         "columns": "State, Last Run",
-#         "condition": (
-#             f"State = ENABLED and Last Run older than "
-#             f"{STALE_DAYS_THRESHOLD} days"
-#         ),
-#         "check": _rule_stale_job,
-#     },
-#     {
-#         "title": "High Frequency Schedule",
-#         "pillar": "Cost",
-#         "recommendation": "Job configured with very high frequency",
-#         "columns": "Cron Schedule",
-#         "condition": (
-#             f"Estimated executions per day > "
-#             f"{HIGH_FREQUENCY_THRESHOLD_PER_DAY}"
-#         ),
-#         "check": _rule_high_frequency,
-#     },
-# ]
-
-
-# def _evaluate_job(project_id, location, job):
-#     """Runs every rule against one job, returning one row per hit."""
-
-#     facts = _extract_job_facts(job)
-
-#     rows = []
-
-#     for rule in RULES:
-
-#         observed_value = rule["check"](facts)
-
-#         if observed_value is None:
-#             continue
-
-#         rows.append(
-#             {
-#                 "Project ID": project_id,
-#                 "Region": location,
-#                 "Job Name": facts["job_name"],
-#                 "Service": SERVICE_NAME,
-#                 "Recommendation Title": rule["title"],
-#                 "Pillar": rule["pillar"],
-#                 "Recommendation": rule["recommendation"],
-#                 "Columns Evaluated": rule["columns"],
-#                 "Condition": rule["condition"],
-#                 "Observed Value": observed_value,
-#             }
-#         )
-
-#     return rows
-
-
-# def main(credentials, org_id, projects):
-
-#     scheduler_client = scheduler_v1.CloudSchedulerClient(
-#         credentials=credentials
-#     )
-
-#     rows = []
-
-#     for project in projects:
-
-#         project_id = project["project_id"]
-#         project_job_count = 0
-#         project_finding_count = 0
-
-#         for location, job in iter_project_jobs(scheduler_client, project_id):
-
-#             project_job_count += 1
-
-#             job_rows = _evaluate_job(project_id, location, job)
-
-#             rows.extend(job_rows)
-#             project_finding_count += len(job_rows)
-
-#         if project_job_count:
-#             logging.info(
-#                 f"[{project_id}] Evaluated {project_job_count} job(s), "
-#                 f"{project_finding_count} finding(s)."
-#             )
-
-#     write_to_sheet(
-#         credentials=credentials,
-#         sheet_name=SHEET_NAME,
-#         rows=rows,
-#         headers=HEADERS,
-#     )
-
-#     logging.info(
-#         f"Cloud Scheduler recommendations complete — {len(rows)} finding(s) total."
-#     )
+    retry_duration = row.get(
+        "Max retry duration",
+        "",
+    ).strip()
+
+    service_account = row.get(
+        "Service Account",
+        "",
+    ).strip()
+
+    cron_schedule = row.get(
+        "Cron Schedule",
+        "",
+    ).strip()
+
+    last_run = parse_datetime(
+        row.get("Last Run", "")
+    )
+
+    #
+    # Operational Excellence
+    #
+
+    if state == "DISABLED":
+
+        add_recommendation(
+            operational,
+            "Disabled Scheduler Job",
+        )
+
+    if (
+        state == "ENABLED"
+        and last_run
+    ):
+
+        now = dt.datetime.now(
+            dt.timezone.utc
+        )
+
+        if last_run.tzinfo is None:
+            last_run = last_run.replace(
+                tzinfo=dt.timezone.utc
+            )
+
+        age = (
+            now - last_run
+        ).days
+
+        if age > STALE_DAYS:
+
+            add_recommendation(
+                operational,
+                "Stale Scheduler Job",
+            )
+
+    #
+    # Reliability
+    #
+
+    if (
+        status
+        and status != "Success"
+        and status != "Has not run yet"
+    ):
+
+        add_recommendation(
+            reliability,
+            "Failed Last Execution",
+        )
+
+    if (
+        retry_enabled == "No"
+        or retry_attempts in (
+            "",
+            "0",
+        )
+    ):
+
+        add_recommendation(
+            reliability,
+            "No Retry Policy Configured",
+        )
+
+    if (
+        retry_duration == ""
+        or retry_duration == "0s"
+    ):
+
+        add_recommendation(
+            reliability,
+            "Unlimited Retry Duration",
+        )
+
+    #
+    # Security
+    #
+
+    if not service_account:
+
+        add_recommendation(
+            security,
+            "Missing Service Account",
+        )
+
+    #
+    # Cost
+    #
+
+    executions = estimate_daily_runs(
+        cron_schedule
+    )
+
+    if executions > HIGH_FREQUENCY_THRESHOLD:
+
+        add_recommendation(
+            cost,
+            "High Frequency Schedule",
+        )
+
+    row["Operational Excellence"] = (
+        "\n".join(operational)
+        if operational
+        else "No Recommendation"
+    )
+
+    row["Reliability"] = (
+        "\n".join(reliability)
+        if reliability
+        else "No Recommendation"
+    )
+
+    row["Security"] = (
+        "\n".join(security)
+        if security
+        else "No Recommendation"
+    )
+
+    row["Cost"] = (
+        "\n".join(cost)
+        if cost
+        else "No Recommendation"
+    )
+
+    return row
+
+def main(credentials, org_id, projects):
+    """
+    Reads the Cloud Scheduler Inventory sheet, evaluates recommendations,
+    appends recommendation columns, and writes the updated sheet back.
+    """
+
+    logging.info("Reading Cloud Scheduler Inventory...")
+
+    rows = read_sheet(
+        credentials=credentials,
+        sheet_name=SHEET_NAME,
+    )
+
+    if not rows:
+        logging.info("No inventory found.")
+        return
+
+    #
+    # Preserve original column order
+    #
+    headers = list(rows[0].keys())
+
+    recommendation_columns = [
+        "Operational Excellence",
+        "Reliability",
+        "Security",
+        "Cost",
+    ]
+
+    #
+    # Add recommendation columns if they don't exist
+    #
+    for column in recommendation_columns:
+
+        if column not in headers:
+            headers.append(column)
+
+    updated_rows = []
+
+    total_findings = 0
+
+    for row in rows:
+
+        updated_row = evaluate_row(row)
+
+        updated_rows.append(updated_row)
+
+        #
+        # Count findings
+        #
+        for pillar in recommendation_columns:
+
+            if (
+                updated_row[pillar]
+                != "No Recommendation"
+            ):
+
+                total_findings += len(
+                    updated_row[pillar].split("\n")
+                )
+
+    write_to_sheet(
+        credentials=credentials,
+        sheet_name=SHEET_NAME,
+        rows=updated_rows,
+        headers=headers,
+    )
+
+    logging.info(
+        f"Cloud Scheduler recommendation completed. "
+        f"{len(updated_rows)} jobs evaluated, "
+        f"{total_findings} recommendation(s) generated."
+    )
