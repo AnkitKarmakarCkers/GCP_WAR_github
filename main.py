@@ -147,7 +147,7 @@ def main():
         credentials=credentials,
         run_mode=run_mode,
         organization_id=organization_id,
-        folder_id=folder_ids,
+        folder_ids=folder_ids,
         project_ids=project_ids,
     )
 

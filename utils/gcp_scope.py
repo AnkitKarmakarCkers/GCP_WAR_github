@@ -36,9 +36,12 @@ def _list_projects(parent, credentials):
     return projects
 
 
-def _list_child_folders(folder_id, credentials):
+def _list_child_folders(parent, credentials):
     """
-    Returns child folders of a folder.
+    Returns child folders of a parent.
+    Parent can be:
+        organizations/<id>
+        folders/<id>
     """
 
     client = resourcemanager_v3.FoldersClient(
@@ -46,7 +49,7 @@ def _list_child_folders(folder_id, credentials):
     )
 
     request = resourcemanager_v3.ListFoldersRequest(
-        parent=f"folders/{folder_id}"
+        parent=parent
     )
 
     return list(client.list_folders(request=request))
@@ -67,7 +70,7 @@ def _collect_folder_projects(folder_id, credentials):
     )
 
     child_folders = _list_child_folders(
-        folder_id,
+        f"folders/{folder_id}",
         credentials,
     )
 
@@ -105,12 +108,42 @@ def get_projects_by_scope(
                 "ORGANIZATION_ID is required."
             )
 
+        # Projects directly attached to the org node itself.
         projects = _list_projects(
             f"organizations/{organization_id}",
             credentials,
         )
 
-    
+        # Resource Manager's projects.list only returns direct
+        # children of the given parent — it does NOT recurse into
+        # folders. Any project nested inside a folder under the org
+        # (the common case) would otherwise be silently missed, so
+        # walk the folder tree the same way RUN_MODE=folder does.
+        top_level_folders = _list_child_folders(
+            f"organizations/{organization_id}",
+            credentials,
+        )
+
+        for folder in top_level_folders:
+
+            folder_id_value = folder.name.split("/")[-1]
+
+            projects.extend(
+                _collect_folder_projects(
+                    folder_id_value,
+                    credentials,
+                )
+            )
+
+        # Remove duplicates in case a project is reachable via
+        # more than one path.
+        unique = {}
+
+        for project in projects:
+            unique[project["project_id"]] = project
+
+        projects = list(unique.values())
+
     elif run_mode == "folder":
 
         if not folder_ids:
@@ -120,10 +153,10 @@ def get_projects_by_scope(
 
         projects = []
 
-        for folder_id in folder_ids:
+        for single_folder_id in folder_ids:
             projects.extend(
                 _collect_folder_projects(
-                    folder_id,
+                    single_folder_id,
                     credentials,
                 )
             )
